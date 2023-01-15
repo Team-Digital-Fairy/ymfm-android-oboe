@@ -1,1 +1,51 @@
 #include "handler.h"
+
+using namespace oboe;
+
+oboe::Result YmfmHandler::open() {
+    mDataCallback = std::make_shared<MyDataCallback>();
+    mErrorCallback = std::make_shared<MyErrorCallback>(this);
+
+    oboe::AudioStreamBuilder builder;
+
+    Result r = builder.setSharingMode(SharingMode::Exclusive)
+            ->setSampleRate(48000)
+            ->setFormat(AudioFormat::Float)
+            ->setPerformanceMode(PerformanceMode::LowLatency)
+            ->setChannelCount(ChannelCount::Stereo)
+            ->setDataCallback(mDataCallback)
+            ->setErrorCallback(mErrorCallback)
+            ->openStream(mStream);
+
+    if(r != Result::OK) return r;
+
+    r = mStream->requestStart();
+    return r;
+}
+
+oboe::Result YmfmHandler::start() {
+    return oboe::Result::OK;
+}
+
+oboe::DataCallbackResult
+YmfmHandler::MyDataCallback::onAudioReady(oboe::AudioStream *audioStream, void *audioData,
+                                          int32_t numFrames) {
+
+    // We requested AudioFormat::Float. So if the stream opens
+    // we know we got the Float format.
+    // If you do not specify a format then you should check what format
+    // the stream has and cast to the appropriate type.
+    auto *outputData = static_cast<float *>(audioData);
+
+    // Generate random numbers (white noise) centered around zero.
+    const float amplitude = 0.2f;
+    for (int i = 0; i < numFrames * 2; ++i) {
+        outputData[i] = ((float) drand48() - 0.5f) * amplitude;
+    }
+    return oboe::DataCallbackResult::Continue;
+}
+
+void
+YmfmHandler::MyErrorCallback::onErrorAfterClose(oboe::AudioStream *oboeStream, oboe::Result error) {
+    LOG_E("%s() - error = %s", __func__, oboe::convertToText(error));
+}
