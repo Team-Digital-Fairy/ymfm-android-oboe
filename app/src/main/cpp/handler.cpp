@@ -19,7 +19,7 @@ oboe::Result YmfmHandler::open() {
 
     if(r != Result::OK) return r;
 
-    r = mStream->requestStart();
+    //r = mStream->requestStart();
     return r;
 }
 
