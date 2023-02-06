@@ -1,4 +1,5 @@
 #include <jni.h>
+#include <error.h>
 
 // ymfm thing
 #include "ymfm.h"
@@ -7,10 +8,12 @@
 #include "ymfm_opm.h"
 #include "ymfm_opn.h"
 
+
+
 // Oboe thing
 #include <oboe/Oboe.h>
 using namespace oboe;
-#include "handler.h"
+#include "old/handler.h.old"
 
 #include <android/log.h>
 
@@ -22,7 +25,7 @@ using namespace oboe;
 
 static YmfmHandler hdr;
 
-using emulated_time = int64_t;
+using emulated_time = uint64_t;
 
 enum chip_type
 {
@@ -99,10 +102,9 @@ public:
     {
         m_chip.reset();
 
-#ifdef EXTRA_CLOCKS
-        for (int clock = 0; clock < EXTRA_CLOCKS; clock++)
+        for (int clock = 0; clock < 0; clock++)
             m_chip.generate(&m_output);
-#endif
+
 
 #if (RUN_NUKED_OPN2)
         if (type == CHIP_YM2612)
@@ -294,13 +296,573 @@ void add_chips(uint32_t clock, chip_type type, char const *chipname)
     }
 }
 
+vgm_chip_base *find_chip(chip_type type, uint8_t index)
+{
+    for (auto &chip : active_chips)
+        if (chip->type() == type && index-- == 0)
+            return chip.get();
+    return nullptr;
+}
+
+
+void write_chip(chip_type type, uint8_t index, uint32_t reg, uint8_t data)
+{
+    vgm_chip_base *chip = find_chip(type, index);
+    if (chip != nullptr)
+        chip->write(reg, data);
+}
+
+uint32_t parse_header(std::vector<uint8_t> &buffer) {
+    // +00: already checked the ID
+    uint32_t offset = 4;
+
+    // +04: parse the size
+    uint32_t size = parse_uint32(buffer, offset);
+    if (offset - 4 + size > buffer.size()) {
+        fprintf(stderr, "Total size for file is too small; file may be truncated\n");
+        size = buffer.size() - 4;
+    }
+    buffer.resize(size + 4);
+
+    // +08: parse the version
+    uint32_t version = parse_uint32(buffer, offset);
+    LOG_I("VGM Version %08X", version);
+    if (version > 0x171)
+        fprintf(stderr, "Warning: version > 1.71 detected, some things may not work\n");
+
+    // +0C: SN76489 clock
+    uint32_t clock = parse_uint32(buffer, offset);
+    if (clock != 0)
+        fprintf(stderr, "Warning: clock for SN76489 specified (%d), but not supported\n", clock);
+
+    // +10: YM2413 clock
+    clock = parse_uint32(buffer, offset);
+    if (clock != 0)
+        add_chips<ymfm::ym2413>(clock, CHIP_YM2413, "YM2413");
+
+    // +14: GD3 offset
+    uint32_t dummy = parse_uint32(buffer, offset);
+
+    // +18: Total # samples
+    dummy = parse_uint32(buffer, offset);
+
+    // +1C: Loop offset
+    dummy = parse_uint32(buffer, offset);
+
+    // +20: Loop # samples
+    dummy = parse_uint32(buffer, offset);
+
+    // +24: Rate
+    dummy = parse_uint32(buffer, offset);
+
+    // +28: SN76489 feedback / SN76489 shift register width / SN76489 Flags
+    dummy = parse_uint32(buffer, offset);
+
+    // +2C: YM2612 clock
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x110 && clock != 0)
+        add_chips<ymfm::ym2612>(clock, CHIP_YM2612, "YM2612");
+
+    // +30: YM2151 clock
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x110 && clock != 0)
+        add_chips<ymfm::ym2151>(clock, CHIP_YM2151, "YM2151");
+
+    // +34: VGM data offset
+    uint32_t data_start = parse_uint32(buffer, offset);
+    data_start += offset - 4;
+    if (version < 0x150)
+        data_start = 0x40;
+
+    // +38: Sega PCM clock
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x151 && clock != 0)
+        fprintf(stderr, "Warning: clock for Sega PCM specified, but not supported\n");
+
+    // +3C: Sega PCM interface register
+    dummy = parse_uint32(buffer, offset);
+
+    // +40: RF5C68 clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x151 && clock != 0)
+        fprintf(stderr, "Warning: clock for RF5C68 specified, but not supported\n");
+
+    // +44: YM2203 clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x151 && clock != 0)
+        add_chips<ymfm::ym2203>(clock, CHIP_YM2203, "YM2203");
+
+    // +48: YM2608 clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x151 && clock != 0)
+        add_chips<ymfm::ym2608>(clock, CHIP_YM2608, "YM2608");
+
+    // +4C: YM2610/2610B clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x151 && clock != 0) {
+        if (clock & 0x80000000)
+            add_chips<ymfm::ym2610b>(clock, CHIP_YM2610, "YM2610B");
+        else
+            add_chips<ymfm::ym2610>(clock, CHIP_YM2610, "YM2610");
+    }
+
+    // +50: YM3812 clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x151 && clock != 0)
+        add_chips<ymfm::ym3812>(clock, CHIP_YM3812, "YM3812");
+
+    // +54: YM3526 clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x151 && clock != 0)
+        add_chips<ymfm::ym3526>(clock, CHIP_YM3526, "YM3526");
+
+    // +58: Y8950 clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x151 && clock != 0)
+        add_chips<ymfm::y8950>(clock, CHIP_Y8950, "Y8950");
+
+    // +5C: YMF262 clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x151 && clock != 0)
+        add_chips<ymfm::ymf262>(clock, CHIP_YMF262, "YMF262");
+
+    // +60: YMF278B clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x151 && clock != 0)
+        add_chips<ymfm::ymf278b>(clock, CHIP_YMF278B, "YMF278B");
+
+    // +64: YMF271 clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x151 && clock != 0)
+        fprintf(stderr, "Warning: clock for YMF271 specified, but not supported\n");
+
+    // +68: YMF280B clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x151 && clock != 0)
+        fprintf(stderr, "Warning: clock for YMF280B specified, but not supported\n");
+
+    // +6C: RF5C164 clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x151 && clock != 0)
+        fprintf(stderr, "Warning: clock for RF5C164 specified, but not supported\n");
+
+    // +70: PWM clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x151 && clock != 0)
+        fprintf(stderr, "Warning: clock for PWM specified, but not supported\n");
+
+    // +74: AY8910 clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x151 && clock != 0) {
+        fprintf(stderr, "Warning: clock for AY8910 specified, substituting YM2149\n");
+        add_chips<ymfm::ym2149>(clock, CHIP_YM2149, "YM2149");
+    }
+
+    // +78: AY8910 flags
+    if (offset + 4 > data_start)
+        return data_start;
+    dummy = parse_uint32(buffer, offset);
+
+    // +7C: volume / loop info
+    if (offset + 4 > data_start)
+        return data_start;
+    dummy = parse_uint32(buffer, offset);
+    if ((dummy & 0xff) != 0)
+        printf("Volume modifier: %02X (=%d)\n", dummy & 0xff,
+               int(pow(2, double(dummy & 0xff) / 0x20)));
+
+    // +80: GameBoy DMG clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x161 && clock != 0)
+        fprintf(stderr, "Warning: clock for GameBoy DMG specified, but not supported\n");
+
+    // +84: NES APU clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x161 && clock != 0)
+        fprintf(stderr, "Warning: clock for NES APU specified, but not supported\n");
+
+    // +88: MultiPCM clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x161 && clock != 0)
+        fprintf(stderr, "Warning: clock for MultiPCM specified, but not supported\n");
+
+    // +8C: uPD7759 clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x161 && clock != 0)
+        fprintf(stderr, "Warning: clock for uPD7759 specified, but not supported\n");
+
+    // +90: OKIM6258 clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x161 && clock != 0)
+        fprintf(stderr, "Warning: clock for OKIM6258 specified, but not supported\n");
+
+    // +94: OKIM6258 Flags / K054539 Flags / C140 Chip Type / reserved
+    if (offset + 4 > data_start)
+        return data_start;
+    dummy = parse_uint32(buffer, offset);
+
+    // +98: OKIM6295 clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x161 && clock != 0)
+        fprintf(stderr, "Warning: clock for OKIM6295 specified, but not supported\n");
+
+    // +9C: K051649 clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x161 && clock != 0)
+        fprintf(stderr, "Warning: clock for K051649 specified, but not supported\n");
+
+    // +A0: K054539 clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x161 && clock != 0)
+        fprintf(stderr, "Warning: clock for K054539 specified, but not supported\n");
+
+    // +A4: HuC6280 clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x161 && clock != 0)
+        fprintf(stderr, "Warning: clock for HuC6280 specified, but not supported\n");
+
+    // +A8: C140 clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x161 && clock != 0)
+        fprintf(stderr, "Warning: clock for C140 specified, but not supported\n");
+
+    // +AC: K053260 clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x161 && clock != 0)
+        fprintf(stderr, "Warning: clock for K053260 specified, but not supported\n");
+
+    // +B0: Pokey clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x161 && clock != 0)
+        fprintf(stderr, "Warning: clock for Pokey specified, but not supported\n");
+
+    // +B4: QSound clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x161 && clock != 0)
+        fprintf(stderr, "Warning: clock for QSound specified, but not supported\n");
+
+    // +B8: SCSP clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x171 && clock != 0)
+        fprintf(stderr, "Warning: clock for SCSP specified, but not supported\n");
+
+    // +BC: extra header offset
+    if (offset + 4 > data_start)
+        return data_start;
+    uint32_t extra_header = parse_uint32(buffer, offset);
+
+    // +C0: WonderSwan clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x171 && clock != 0)
+        fprintf(stderr, "Warning: clock for WonderSwan specified, but not supported\n");
+
+    // +C4: VSU clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x171 && clock != 0)
+        fprintf(stderr, "Warning: clock for VSU specified, but not supported\n");
+
+    // +C8: SAA1099 clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x171 && clock != 0)
+        fprintf(stderr, "Warning: clock for SAA1099 specified, but not supported\n");
+
+    // +CC: ES5503 clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x171 && clock != 0)
+        fprintf(stderr, "Warning: clock for ES5503 specified, but not supported\n");
+
+    // +D0: ES5505/ES5506 clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x171 && clock != 0)
+        fprintf(stderr, "Warning: clock for ES5505/ES5506 specified, but not supported\n");
+
+    // +D4: ES5503 output channels / ES5505/ES5506 amount of output channels / C352 clock divider
+    if (offset + 4 > data_start)
+        return data_start;
+    dummy = parse_uint32(buffer, offset);
+
+    // +D8: X1-010 clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x171 && clock != 0)
+        fprintf(stderr, "Warning: clock for X1-010 specified, but not supported\n");
+
+    // +DC: C352 clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x171 && clock != 0)
+        fprintf(stderr, "Warning: clock for C352 specified, but not supported\n");
+
+    // +E0: GA20 clock
+    if (offset + 4 > data_start)
+        return data_start;
+    clock = parse_uint32(buffer, offset);
+    if (version >= 0x171 && clock != 0)
+        fprintf(stderr, "Warning: clock for GA20 specified, but not supported\n");
+
+    return data_start;
+}
+
+void generate_tick(std::vector<uint8_t> &buffer, uint32_t data_start, uint32_t output_rate, int32_t *fill) {
+    static uint32_t offset = data_start;
+    static bool done = false;
+    emulated_time output_step = 0x100000000ull / output_rate;
+    static emulated_time output_pos = 0;
+
+    //for(int i=0; i<size; i++) {
+        static int delay = 0;
+
+
+        if(delay-- != 0) {
+            int32_t outputs[2] = {0};
+            for (auto &chip: active_chips) {
+                chip->generate(output_pos, output_step, outputs);
+            }
+            output_pos += output_step;
+            fill[0] = outputs[0];
+            fill[1] = outputs[1];
+            return;
+        } else {
+            while(delay <= 0) {
+                if (done) break;
+                if (offset+1 >= buffer.size()) break;
+
+                uint8_t cmd = buffer[offset++];
+
+                switch (cmd) {
+                    case 0x52:
+                    case 0xa2:
+                        write_chip(CHIP_YM2612, cmd >> 7, buffer[offset], buffer[offset + 1]);
+                        //LOG_I("Write port0 ym2612 0x%02X:0x%02X", buffer[offset + 1],
+                        //buffer[offset]);
+                        offset += 2;
+                        break;
+
+                        // YM2612 port 1, write value dd to register aa
+                    case 0x53:
+                    case 0xa3:
+                        write_chip(CHIP_YM2612, cmd >> 7, buffer[offset] | 0x100,
+                                   buffer[offset + 1]);
+                        //LOG_I("Write port1 ym2612 0x%02X:0x%02X", buffer[offset + 1],
+                        //      buffer[offset]);
+                        offset += 2;
+                        break;
+
+                        // Wait n samples, n can range from 0 to 65535 (approx 1.49 seconds)
+                    case 0x61:
+                        delay = buffer[offset] | (buffer[offset + 1] << 8);
+                        //LOG_I("Delay %06d", (buffer[offset] | (buffer[offset + 1] << 8)));
+
+                        offset += 2;
+                        break;
+
+                        // wait 735 samples (60th of a second)
+                    case 0x62:
+                        delay = 735;
+                        break;
+
+                        // wait 882 samples (50th of a second)
+                    case 0x63:
+                        delay = 882;
+                        break;
+
+                        // end of sound data
+                    case 0x66:
+                        done = true;
+                        break;
+
+
+                    case 0x30:
+                    case 0x31:
+                    case 0x32:
+                    case 0x33:
+                    case 0x34:
+                    case 0x35:
+                    case 0x36:
+                    case 0x37:
+                    case 0x38:
+                    case 0x39:
+                    case 0x3a:
+                    case 0x3b:
+                    case 0x3c:
+                    case 0x3d:
+                    case 0x3e:
+                    case 0x3f:
+                    case 0x4f:    // dd: Game Gear PSG stereo, write dd to port 0x06
+                    case 0x50:    // dd: PSG (SN76489/SN76496) write value dd
+                        offset++;
+                        break;
+
+                    case 0x70:
+                    case 0x71:
+                    case 0x72:
+                    case 0x73:
+                    case 0x74:
+                    case 0x75:
+                    case 0x76:
+                    case 0x77:
+                    case 0x78:
+                    case 0x79:
+                    case 0x7a:
+                    case 0x7b:
+                    case 0x7c:
+                    case 0x7d:
+                    case 0x7e:
+                    case 0x7f:
+                        delay = (cmd & 15) + 1;
+                        break;
+                    default:
+                        LOG_E("Unhandled value 0x%02X at %08X", cmd, offset);
+                }
+            }
+    }
+
+    //}
+}
+
+uint32_t data_start;
+std::vector<uint8_t> buffer;
+
+
+class MyCallback : public oboe::AudioStreamDataCallback {
+public:
+    oboe::DataCallbackResult
+    onAudioReady(oboe::AudioStream *audioStream, void *audioData, int32_t numFrames) override {
+
+
+
+        for(int i=0; i<numFrames; ++i)
+            generate_tick(buffer, data_start, 48000, (int32_t*)((int32_t*)audioData + i));
+
+
+        return oboe::DataCallbackResult::Continue;
+    }
+};
+
+class ErrorCallback : public oboe::AudioStreamErrorCallback {
+public:
+    void onErrorAfterClose(AudioStream *stream, Result error) override {
+        LOG_I("%s() - error = %s",__func__,oboe::convertToText(error));
+    }
+};
+
+std::shared_ptr<oboe::AudioStream> mStream;
+std::shared_ptr<MyCallback> mMyCallback;
+std::shared_ptr<ErrorCallback> mErrorCallback;
 
 extern "C"
 JNIEXPORT void JNICALL
 Java_team_digitalfairy_ymfm_1thing_YmfmInterface_startOboe(JNIEnv *env, jclass clazz) {
-    hdr.open();
+    mMyCallback = std::make_shared<MyCallback>();
+    mErrorCallback = std::make_shared<ErrorCallback>();
 
-    add_chips<ymfm::ym2151>(3579545, CHIP_YM2151, "YM2151");
+    oboe::AudioStreamBuilder b;
+
+    b.setDirection(oboe::Direction::Output);
+    b.setPerformanceMode(oboe::PerformanceMode::LowLatency);
+    b.setSharingMode(oboe::SharingMode::Exclusive);
+    b.setFramesPerCallback(128);
+    b.setFormat(oboe::AudioFormat::I32);
+    b.setSampleRate(48000);
+
+    b.setChannelCount(oboe::ChannelCount::Mono);
+
+    b.setDataCallback(mMyCallback);
+    b.setErrorCallback(mErrorCallback);
+
+    oboe::Result r = b.openStream(mStream);
+
+    FILE *fp = fopen("/data/local/tmp/test.vgm","rb");
+    if(fp == nullptr) {
+        LOG_E("Error: File open failure %d %s",errno, strerror(errno));
+        return;
+    }
+
+    fseek(fp, 0, SEEK_END);
+    uint32_t sz = ftell(fp);
+    rewind(fp);
+    buffer = std::vector<uint8_t>(sz);
+
+    auto bytes_read = fread(&buffer[0],1,sz,fp);
+    // TODO: Error check
+    // TODO: Decompress Gzip on memory
+
+    fclose(fp);
+
+    data_start = parse_header(buffer);
+
+    // we are ready for actual output!
+
+    r = mStream->requestStart();
+
 
 
 }
@@ -308,3 +870,5 @@ Java_team_digitalfairy_ymfm_1thing_YmfmInterface_startOboe(JNIEnv *env, jclass c
 // Step 1. load VGM file and prepare YMFM Context
 // Step 2. Run down the VGM ticks bound to 44100; yet sound needs to be aligned to 44100
 //
+
+//     add_chips<ymfm::ym2151>(3579545, CHIP_YM2151, "YM2151");

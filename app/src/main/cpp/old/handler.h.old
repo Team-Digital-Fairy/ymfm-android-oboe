@@ -2,12 +2,12 @@
 // Created by Alma on 2023/01/15.
 //
 
-#ifndef YMFMTHING_HANDLER_H
-#define YMFMTHING_HANDLER_H
+#ifndef YMFMTHING_HANDLER_H_OLD
+#define YMFMTHING_HANDLER_H_OLD
 
-#include <oboe/Oboe.h>
+#include "../../../../../../../.gradle/caches/transforms-3/8d7a66bb88a3c1221176ae171c53b489/transformed/oboe-1.7.0/prefab/modules/oboe/include/oboe/Oboe.h"
 
-#include <android/log.h>
+#include "../../../../../../../AppData/Local/Android/Sdk/ndk/23.1.7779620/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/include/android/log.h"
 
 #define LOG_TAG "JNI-ymfm"
 
@@ -49,4 +49,4 @@ private:
 };
 
 
-#endif //YMFMTHING_HANDLER_H
+#endif //YMFMTHING_HANDLER_H_OLD
