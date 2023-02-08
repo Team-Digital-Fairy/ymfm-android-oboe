@@ -28,6 +28,13 @@ static YmfmHandler hdr;
 
 using emulated_time = uint64_t;
 
+// VGM Datas
+
+uint32_t data_start;
+uint32_t loop_offset;
+std::vector<uint8_t> buffer;
+
+
 enum chip_type
 {
     CHIP_YM2149,
@@ -128,7 +135,7 @@ public:
     // handle a register write: just queue for now
     virtual void write(uint32_t reg, uint8_t data) override
     {
-        m_queue.push_back(std::make_pair(reg, data));
+        m_queue.emplace_back(reg, data);
     }
 
     // generate one output sample of output
@@ -348,7 +355,7 @@ uint32_t parse_header(std::vector<uint8_t> &buffer) {
     dummy = parse_uint32(buffer, offset);
 
     // +1C: Loop offset
-    dummy = parse_uint32(buffer, offset);
+    loop_offset = parse_uint32(buffer, offset);
 
     // +20: Loop # samples
     dummy = parse_uint32(buffer, offset);
@@ -370,10 +377,10 @@ uint32_t parse_header(std::vector<uint8_t> &buffer) {
         add_chips<ymfm::ym2151>(clock, CHIP_YM2151, "YM2151");
 
     // +34: VGM data offset
-    uint32_t data_start = parse_uint32(buffer, offset);
-    data_start += offset - 4;
+    uint32_t ds = parse_uint32(buffer, offset);
+    ds += offset - 4;
     if (version < 0x150)
-        data_start = 0x40;
+        ds = 0x40;
 
     // +38: Sega PCM clock
     clock = parse_uint32(buffer, offset);
@@ -692,445 +699,480 @@ float clamp_to_one(float in) {
     return fminf(fmaxf(in, -1.0f), 1.0f);
 }
 
-float int32_to_int16(int32_t value) {
+float int32_to_float(int32_t value) {
+    /*
     float data = 0.0;
     if(value < 0) data = (float)(value / 32767.0);
     else data = (float)(value / 32768.0);
     return clamp_to_one(data);
+    */
+    //LOG_D("Input %d Output %f",value,clamp_to_one((float)(value / 32768.0)))
+    return (float)(value /  32767.0);
 }
 
-void generate_tick(std::vector<uint8_t> &buffer, uint32_t data_start, uint32_t output_rate, float *fill) {
+inline int16_t int32_to_int16(int32_t value) {
+    // preserve signedness
+   return (int16_t)(value / 32767);
+}
+
+void generate_tick(std::vector<uint8_t> &buffer, uint32_t data_start, uint32_t output_rate, float *fill, size_t fill_size) {
     static uint32_t offset = data_start;
     static bool done = false;
     const emulated_time output_step = 0x100000000ull / output_rate;
     static emulated_time output_pos = 0;
 
-    if(delay != 0) {
-        int32_t outputs[2] = {0};
-        for (auto &chip: active_chips) {
-            chip->generate(output_pos, output_step, outputs);
+    for(int i=0; i<fill_size; i+=2) {
+        if(delay != 0) {
+            int32_t outputs[2] = {0};
+            for (auto &chip: active_chips) {
+                chip->generate(output_pos, output_step, outputs);
+            }
+            output_pos += output_step;
+            fill[i] = int32_to_float(outputs[0] * 1.5);
+            fill[i+1] = int32_to_float(outputs[1] * 1.5);
+            delay--;
+            continue;
         }
-        output_pos += output_step;
-        fill[0] = int32_to_int16(outputs[0]);
-        fill[1] = int32_to_int16(outputs[1]);
-        delay--;
-        return;
-    }
 
-    while(delay == 0) {
-        uint8_t cmd = buffer[offset++];
-        switch (cmd) {
-            // YM2413, write value dd to register aa
-            case 0x51:
-            case 0xa1:
-                write_chip(CHIP_YM2413, cmd >> 7, buffer[offset], buffer[offset + 1]);
-                offset += 2;
-                break;
+        while (delay <= 0) {
+            if (done) {
+                offset = loop_offset;
+                done = false;
+            }
+            if (offset + 1 >= buffer.size()) return;
+            uint8_t cmd = buffer[offset++];
 
-                // YM2612 port 0, write value dd to register aa
-            case 0x52:
-            case 0xa2:
-                write_chip(CHIP_YM2612, cmd >> 7, buffer[offset], buffer[offset + 1]);
-                offset += 2;
-                break;
-
-                // YM2612 port 1, write value dd to register aa
-            case 0x53:
-            case 0xa3:
-                write_chip(CHIP_YM2612, cmd >> 7, buffer[offset] | 0x100, buffer[offset + 1]);
-                offset += 2;
-                break;
-
-                // YM2151, write value dd to register aa
-            case 0x54:
-            case 0xa4:
-                write_chip(CHIP_YM2151, cmd >> 7, buffer[offset], buffer[offset + 1]);
-                offset += 2;
-                break;
-
-                // YM2203, write value dd to register aa
-            case 0x55:
-            case 0xa5:
-                write_chip(CHIP_YM2203, cmd >> 7, buffer[offset], buffer[offset + 1]);
-                offset += 2;
-                break;
-
-                // YM2608 port 0, write value dd to register aa
-            case 0x56:
-            case 0xa6:
-                write_chip(CHIP_YM2608, cmd >> 7, buffer[offset], buffer[offset + 1]);
-                offset += 2;
-                break;
-
-                // YM2608 port 1, write value dd to register aa
-            case 0x57:
-            case 0xa7:
-                write_chip(CHIP_YM2608, cmd >> 7, buffer[offset] | 0x100, buffer[offset + 1]);
-                offset += 2;
-                break;
-
-                // YM2610 port 0, write value dd to register aa
-            case 0x58:
-            case 0xa8:
-                write_chip(CHIP_YM2610, cmd >> 7, buffer[offset], buffer[offset + 1]);
-                offset += 2;
-                break;
-
-                // YM2610 port 1, write value dd to register aa
-            case 0x59:
-            case 0xa9:
-                write_chip(CHIP_YM2610, cmd >> 7, buffer[offset] | 0x100, buffer[offset + 1]);
-                offset += 2;
-                break;
-
-                // YM3812, write value dd to register aa
-            case 0x5a:
-            case 0xaa:
-                write_chip(CHIP_YM3812, cmd >> 7, buffer[offset], buffer[offset + 1]);
-                offset += 2;
-                break;
-
-                // YM3526, write value dd to register aa
-            case 0x5b:
-            case 0xab:
-                write_chip(CHIP_YM3526, cmd >> 7, buffer[offset], buffer[offset + 1]);
-                offset += 2;
-                break;
-
-                // Y8950, write value dd to register aa
-            case 0x5c:
-            case 0xac:
-                write_chip(CHIP_Y8950, cmd >> 7, buffer[offset], buffer[offset + 1]);
-                offset += 2;
-                break;
-
-                // YMF262 port 0, write value dd to register aa
-            case 0x5e:
-            case 0xae:
-                write_chip(CHIP_YMF262, cmd >> 7, buffer[offset], buffer[offset + 1]);
-                offset += 2;
-                break;
-
-                // YMF262 port 1, write value dd to register aa
-            case 0x5f:
-            case 0xaf:
-                write_chip(CHIP_YMF262, cmd >> 7, buffer[offset] | 0x100, buffer[offset + 1]);
-                offset += 2;
-                break;
-
-                // Wait n samples, n can range from 0 to 65535 (approx 1.49 seconds)
-            case 0x61:
-                delay = buffer[offset] | (buffer[offset + 1] << 8);
-                offset += 2;
-                break;
-
-                // wait 735 samples (60th of a second)
-            case 0x62:
-                delay = 735;
-                break;
-
-                // wait 882 samples (50th of a second)
-            case 0x63:
-                delay = 882;
-                break;
-
-                // end of sound data
-            case 0x66:
-                done = true;
-                break;
-
-                // data block
-            case 0x67: {
-                uint8_t dummy = buffer[offset++];
-                if (dummy != 0x66)
+            switch (cmd) {
+                // YM2413, write value dd to register aa
+                case 0x51:
+                case 0xa1:
+                    write_chip(CHIP_YM2413, cmd >> 7, buffer[offset], buffer[offset + 1]);
+                    offset += 2;
                     break;
-                uint8_t type = buffer[offset++];
-                uint32_t size = parse_uint32(buffer, offset);
-                uint32_t localoffset = offset;
 
-                switch (type) {
-                    case 0x01: // RF5C68 PCM data for use with associated commands
-                    case 0x02: // RF5C164 PCM data for use with associated commands
-                    case 0x03: // PWM PCM data for use with associated commands
-                    case 0x04: // OKIM6258 ADPCM data for use with associated commands
-                    case 0x05: // HuC6280 PCM data for use with associated commands
-                    case 0x06: // SCSP PCM data for use with associated commands
-                    case 0x07: // NES APU DPCM data for use with associated commands
-                        break;
+                    // YM2612 port 0, write value dd to register aa
+                case 0x52:
+                case 0xa2:
+                    write_chip(CHIP_YM2612, cmd >> 7, buffer[offset], buffer[offset + 1]);
+                    offset += 2;
+                    break;
 
-                    case 0x00: // YM2612 PCM data for use with associated commands
-                    {
-                        vgm_chip_base *chip = find_chip(CHIP_YM2612, 0);
-                        if (chip != nullptr)
-                            chip->write_data(ymfm::ACCESS_PCM, 0, size - 8, &buffer[localoffset]);
+                    // YM2612 port 1, write value dd to register aa
+                case 0x53:
+                case 0xa3:
+                    write_chip(CHIP_YM2612, cmd >> 7, buffer[offset] | 0x100,
+                               buffer[offset + 1]);
+                    offset += 2;
+                    break;
+
+                    // YM2151, write value dd to register aa
+                case 0x54:
+                case 0xa4:
+                    write_chip(CHIP_YM2151, cmd >> 7, buffer[offset], buffer[offset + 1]);
+                    offset += 2;
+                    break;
+
+                    // YM2203, write value dd to register aa
+                case 0x55:
+                case 0xa5:
+                    write_chip(CHIP_YM2203, cmd >> 7, buffer[offset], buffer[offset + 1]);
+                    offset += 2;
+                    break;
+
+                    // YM2608 port 0, write value dd to register aa
+                case 0x56:
+                case 0xa6:
+                    write_chip(CHIP_YM2608, cmd >> 7, buffer[offset], buffer[offset + 1]);
+                    offset += 2;
+                    break;
+
+                    // YM2608 port 1, write value dd to register aa
+                case 0x57:
+                case 0xa7:
+                    write_chip(CHIP_YM2608, cmd >> 7, buffer[offset] | 0x100,
+                               buffer[offset + 1]);
+                    offset += 2;
+                    break;
+
+                    // YM2610 port 0, write value dd to register aa
+                case 0x58:
+                case 0xa8:
+                    write_chip(CHIP_YM2610, cmd >> 7, buffer[offset], buffer[offset + 1]);
+                    offset += 2;
+                    break;
+
+                    // YM2610 port 1, write value dd to register aa
+                case 0x59:
+                case 0xa9:
+                    write_chip(CHIP_YM2610, cmd >> 7, buffer[offset] | 0x100,
+                               buffer[offset + 1]);
+                    offset += 2;
+                    break;
+
+                    // YM3812, write value dd to register aa
+                case 0x5a:
+                case 0xaa:
+                    write_chip(CHIP_YM3812, cmd >> 7, buffer[offset], buffer[offset + 1]);
+                    offset += 2;
+                    break;
+
+                    // YM3526, write value dd to register aa
+                case 0x5b:
+                case 0xab:
+                    write_chip(CHIP_YM3526, cmd >> 7, buffer[offset], buffer[offset + 1]);
+                    offset += 2;
+                    break;
+
+                    // Y8950, write value dd to register aa
+                case 0x5c:
+                case 0xac:
+                    write_chip(CHIP_Y8950, cmd >> 7, buffer[offset], buffer[offset + 1]);
+                    offset += 2;
+                    break;
+
+                    // YMF262 port 0, write value dd to register aa
+                case 0x5e:
+                case 0xae:
+                    write_chip(CHIP_YMF262, cmd >> 7, buffer[offset], buffer[offset + 1]);
+                    offset += 2;
+                    break;
+
+                    // YMF262 port 1, write value dd to register aa
+                case 0x5f:
+                case 0xaf:
+                    write_chip(CHIP_YMF262, cmd >> 7, buffer[offset] | 0x100,
+                               buffer[offset + 1]);
+                    offset += 2;
+                    break;
+
+                    // Wait n samples, n can range from 0 to 65535 (approx 1.49 seconds)
+                case 0x61:
+                    delay = buffer[offset] | (buffer[offset + 1] << 8);
+                    offset += 2;
+                    break;
+
+                    // wait 735 samples (60th of a second)
+                case 0x62:
+                    delay = 735;
+                    break;
+
+                    // wait 882 samples (50th of a second)
+                case 0x63:
+                    delay = 882;
+                    break;
+
+                    // end of sound data
+                case 0x66:
+                    done = true;
+                    break;
+
+                    // data block
+                case 0x67: {
+                    uint8_t dummy = buffer[offset++];
+                    if (dummy != 0x66)
                         break;
+                    uint8_t type = buffer[offset++];
+                    uint32_t size = parse_uint32(buffer, offset);
+                    uint32_t localoffset = offset;
+
+                    switch (type) {
+                        case 0x01: // RF5C68 PCM data for use with associated commands
+                        case 0x02: // RF5C164 PCM data for use with associated commands
+                        case 0x03: // PWM PCM data for use with associated commands
+                        case 0x04: // OKIM6258 ADPCM data for use with associated commands
+                        case 0x05: // HuC6280 PCM data for use with associated commands
+                        case 0x06: // SCSP PCM data for use with associated commands
+                        case 0x07: // NES APU DPCM data for use with associated commands
+                            break;
+
+                        case 0x00: // YM2612 PCM data for use with associated commands
+                        {
+                            vgm_chip_base *chip = find_chip(CHIP_YM2612, 0);
+                            if (chip != nullptr)
+                                chip->write_data(ymfm::ACCESS_PCM, 0, size - 8,
+                                                 &buffer[localoffset]);
+                            break;
+                        }
+
+                        case 0x82: // YM2610 ADPCM ROM data
+                            add_rom_data(CHIP_YM2610, ymfm::ACCESS_ADPCM_A, buffer, localoffset,
+                                         size - 8);
+                            break;
+
+                        case 0x81: // YM2608 DELTA-T ROM data
+                            add_rom_data(CHIP_YM2608, ymfm::ACCESS_ADPCM_B, buffer, localoffset,
+                                         size - 8);
+                            break;
+
+                        case 0x83: // YM2610 DELTA-T ROM data
+                            add_rom_data(CHIP_YM2610, ymfm::ACCESS_ADPCM_B, buffer, localoffset,
+                                         size - 8);
+                            break;
+
+                        case 0x84: // YMF278B ROM data
+                        case 0x87: // YMF278B RAM data
+                            add_rom_data(CHIP_YMF278B, ymfm::ACCESS_PCM, buffer, localoffset,
+                                         size - 8);
+                            break;
+
+                        case 0x88: // Y8950 DELTA-T ROM data
+                            add_rom_data(CHIP_Y8950, ymfm::ACCESS_ADPCM_B, buffer, localoffset,
+                                         size - 8);
+                            break;
+
+                        case 0x80: // Sega PCM ROM data
+                        case 0x85: // YMF271 ROM data
+                        case 0x86: // YMZ280B ROM data
+                        case 0x89: // MultiPCM ROM data
+                        case 0x8A: // uPD7759 ROM data
+                        case 0x8B: // OKIM6295 ROM data
+                        case 0x8C: // K054539 ROM data
+                        case 0x8D: // C140 ROM data
+                        case 0x8E: // K053260 ROM data
+                        case 0x8F: // Q-Sound ROM data
+                        case 0x90: // ES5505/ES5506 ROM data
+                        case 0x91: // X1-010 ROM data
+                        case 0x92: // C352 ROM data
+                        case 0x93: // GA20 ROM data
+                            break;
+
+                        case 0xC0: // RF5C68 RAM write
+                        case 0xC1: // RF5C164 RAM write
+                        case 0xC2: // NES APU RAM write
+                        case 0xE0: // SCSP RAM write
+                        case 0xE1: // ES5503 RAM write
+                            break;
+
+                        default:
+                            if (type >= 0x40 && type < 0x7f)
+                                printf("Compressed data block not supported\n");
+                            else
+                                printf("Unknown data block type 0x%02X\n", type);
+                            break;
                     }
-
-                    case 0x82: // YM2610 ADPCM ROM data
-                        add_rom_data(CHIP_YM2610, ymfm::ACCESS_ADPCM_A, buffer, localoffset,
-                                     size - 8);
-                        break;
-
-                    case 0x81: // YM2608 DELTA-T ROM data
-                        add_rom_data(CHIP_YM2608, ymfm::ACCESS_ADPCM_B, buffer, localoffset,
-                                     size - 8);
-                        break;
-
-                    case 0x83: // YM2610 DELTA-T ROM data
-                        add_rom_data(CHIP_YM2610, ymfm::ACCESS_ADPCM_B, buffer, localoffset,
-                                     size - 8);
-                        break;
-
-                    case 0x84: // YMF278B ROM data
-                    case 0x87: // YMF278B RAM data
-                        add_rom_data(CHIP_YMF278B, ymfm::ACCESS_PCM, buffer, localoffset, size - 8);
-                        break;
-
-                    case 0x88: // Y8950 DELTA-T ROM data
-                        add_rom_data(CHIP_Y8950, ymfm::ACCESS_ADPCM_B, buffer, localoffset,
-                                     size - 8);
-                        break;
-
-                    case 0x80: // Sega PCM ROM data
-                    case 0x85: // YMF271 ROM data
-                    case 0x86: // YMZ280B ROM data
-                    case 0x89: // MultiPCM ROM data
-                    case 0x8A: // uPD7759 ROM data
-                    case 0x8B: // OKIM6295 ROM data
-                    case 0x8C: // K054539 ROM data
-                    case 0x8D: // C140 ROM data
-                    case 0x8E: // K053260 ROM data
-                    case 0x8F: // Q-Sound ROM data
-                    case 0x90: // ES5505/ES5506 ROM data
-                    case 0x91: // X1-010 ROM data
-                    case 0x92: // C352 ROM data
-                    case 0x93: // GA20 ROM data
-                        break;
-
-                    case 0xC0: // RF5C68 RAM write
-                    case 0xC1: // RF5C164 RAM write
-                    case 0xC2: // NES APU RAM write
-                    case 0xE0: // SCSP RAM write
-                    case 0xE1: // ES5503 RAM write
-                        break;
-
-                    default:
-                        if (type >= 0x40 && type < 0x7f)
-                            printf("Compressed data block not supported\n");
-                        else
-                            printf("Unknown data block type 0x%02X\n", type);
-                        break;
+                    offset += size;
+                    break;
                 }
-                offset += size;
-                break;
+
+                    // PCM RAM write
+                case 0x68:
+                    printf("68: PCM RAM write\n");
+                    break;
+
+                    // AY8910, write value dd to register aa
+                case 0xa0:
+                    write_chip(CHIP_YM2149, buffer[offset] >> 7, buffer[offset] & 0x7f,
+                               buffer[offset + 1]);
+                    offset += 2;
+                    break;
+
+                    // pp aa dd: YMF278B, port pp, write value dd to register aa
+                case 0xd0:
+                    write_chip(CHIP_YMF278B, buffer[offset] >> 7,
+                               ((buffer[offset] & 0x7f) << 8) | buffer[offset + 1],
+                               buffer[offset + 2]);
+                    offset += 3;
+                    break;
+
+                case 0x70:
+                case 0x71:
+                case 0x72:
+                case 0x73:
+                case 0x74:
+                case 0x75:
+                case 0x76:
+                case 0x77:
+                case 0x78:
+                case 0x79:
+                case 0x7a:
+                case 0x7b:
+                case 0x7c:
+                case 0x7d:
+                case 0x7e:
+                case 0x7f:
+                    delay = (cmd & 15) + 1;
+                    break;
+
+                case 0x80:
+                case 0x81:
+                case 0x82:
+                case 0x83:
+                case 0x84:
+                case 0x85:
+                case 0x86:
+                case 0x87:
+                case 0x88:
+                case 0x89:
+                case 0x8a:
+                case 0x8b:
+                case 0x8c:
+                case 0x8d:
+                case 0x8e:
+                case 0x8f: {
+                    vgm_chip_base *chip = find_chip(CHIP_YM2612, 0);
+                    if (chip != nullptr)
+                        chip->write(0x2a, chip->read_pcm());
+                    delay = cmd & 15;
+                    break;
+                }
+
+                    // ignored, consume one byte
+                case 0x30:
+                case 0x31:
+                case 0x32:
+                case 0x33:
+                case 0x34:
+                case 0x35:
+                case 0x36:
+                case 0x37:
+                case 0x38:
+                case 0x39:
+                case 0x3a:
+                case 0x3b:
+                case 0x3c:
+                case 0x3d:
+                case 0x3e:
+                case 0x3f:
+                case 0x4f:    // dd: Game Gear PSG stereo, write dd to port 0x06
+                case 0x50:    // dd: PSG (SN76489/SN76496) write value dd
+                    offset++;
+                    break;
+
+                    // ignored, consume two bytes
+                case 0x40:
+                case 0x41:
+                case 0x42:
+                case 0x43:
+                case 0x44:
+                case 0x45:
+                case 0x46:
+                case 0x47:
+                case 0x48:
+                case 0x49:
+                case 0x4a:
+                case 0x4b:
+                case 0x4c:
+                case 0x4d:
+                case 0x4e:
+                case 0x5d:    // aa dd: YMZ280B, write value dd to register aa
+                case 0xb0:    // aa dd: RF5C68, write value dd to register aa
+                case 0xb1:    // aa dd: RF5C164, write value dd to register aa
+                case 0xb2:    // aa dd: PWM, write value ddd to register a (d is MSB, dd is LSB)
+                case 0xb3:    // aa dd: GameBoy DMG, write value dd to register aa
+                case 0xb4:    // aa dd: NES APU, write value dd to register aa
+                case 0xb5:    // aa dd: MultiPCM, write value dd to register aa
+                case 0xb6:    // aa dd: uPD7759, write value dd to register aa
+                case 0xb7:    // aa dd: OKIM6258, write value dd to register aa
+                case 0xb8:    // aa dd: OKIM6295, write value dd to register aa
+                case 0xb9:    // aa dd: HuC6280, write value dd to register aa
+                case 0xba:    // aa dd: K053260, write value dd to register aa
+                case 0xbb:    // aa dd: Pokey, write value dd to register aa
+                case 0xbc:    // aa dd: WonderSwan, write value dd to register aa
+                case 0xbd:    // aa dd: SAA1099, write value dd to register aa
+                case 0xbe:    // aa dd: ES5506, write value dd to register aa
+                case 0xbf:    // aa dd: GA20, write value dd to register aa
+                    offset += 2;
+                    break;
+
+                    // ignored, consume three bytes
+                case 0xc9:
+                case 0xca:
+                case 0xcb:
+                case 0xcc:
+                case 0xcd:
+                case 0xce:
+                case 0xcf:
+                case 0xd7:
+                case 0xd8:
+                case 0xd9:
+                case 0xda:
+                case 0xdb:
+                case 0xdc:
+                case 0xdd:
+                case 0xde:
+                case 0xdf:
+                case 0xc0:    // bbaa dd: Sega PCM, write value dd to memory offset aabb
+                case 0xc1:    // bbaa dd: RF5C68, write value dd to memory offset aabb
+                case 0xc2:    // bbaa dd: RF5C164, write value dd to memory offset aabb
+                case 0xc3:    // cc bbaa: MultiPCM, write set bank offset aabb to channel cc
+                case 0xc4:    // mmll rr: QSound, write value mmll to register rr (mm - data MSB, ll - data LSB)
+                case 0xc5:    // mmll dd: SCSP, write value dd to memory offset mmll (mm - offset MSB, ll - offset LSB)
+                case 0xc6:    // mmll dd: WonderSwan, write value dd to memory offset mmll (mm - offset MSB, ll - offset LSB)
+                case 0xc7:    // mmll dd: VSU, write value dd to memory offset mmll (mm - offset MSB, ll - offset LSB)
+                case 0xc8:    // mmll dd: X1-010, write value dd to memory offset mmll (mm - offset MSB, ll - offset LSB)
+                case 0xd1:    // pp aa dd: YMF271, port pp, write value dd to register aa
+                case 0xd2:    // pp aa dd: SCC1, port pp, write value dd to register aa
+                case 0xd3:    // pp aa dd: K054539, write value dd to register ppaa
+                case 0xd4:    // pp aa dd: C140, write value dd to register ppaa
+                case 0xd5:    // pp aa dd: ES5503, write value dd to register ppaa
+                case 0xd6:    // pp aa dd: ES5506, write value aadd to register pp
+                    offset += 3;
+                    break;
+
+                    // ignored, consume four bytes
+                case 0xe0:    // dddddddd: Seek to offset dddddddd (Intel byte order) in PCM data bank of data block type 0 (YM2612).
+                {
+                    vgm_chip_base *chip = find_chip(CHIP_YM2612, 0);
+                    uint32_t pos = parse_uint32(buffer, offset);
+                    if (chip != nullptr)
+                        chip->seek_pcm(pos);
+                    offset += 4;
+                    break;
+                }
+                case 0xe1:    // mmll aadd: C352, write value aadd to register mmll
+                case 0xe2:
+                case 0xe3:
+                case 0xe4:
+                case 0xe5:
+                case 0xe6:
+                case 0xe7:
+                case 0xe8:
+                case 0xe9:
+                case 0xea:
+                case 0xeb:
+                case 0xec:
+                case 0xed:
+                case 0xee:
+                case 0xef:
+                case 0xf0:
+                case 0xf1:
+                case 0xf2:
+                case 0xf3:
+                case 0xf4:
+                case 0xf5:
+                case 0xf6:
+                case 0xf7:
+                case 0xf8:
+                case 0xf9:
+                case 0xfa:
+                case 0xfb:
+                case 0xfc:
+                case 0xfd:
+                case 0xfe:
+                case 0xff:
+                    offset += 4;
+                    break;
+
+                default:
+                    LOG_E("Unhandled command! 0x%02X at %08X", cmd, offset);
             }
 
-                // PCM RAM write
-            case 0x68:
-                printf("68: PCM RAM write\n");
-                break;
-
-                // AY8910, write value dd to register aa
-            case 0xa0:
-                write_chip(CHIP_YM2149, buffer[offset] >> 7, buffer[offset] & 0x7f,
-                           buffer[offset + 1]);
-                offset += 2;
-                break;
-
-                // pp aa dd: YMF278B, port pp, write value dd to register aa
-            case 0xd0:
-                write_chip(CHIP_YMF278B, buffer[offset] >> 7,
-                           ((buffer[offset] & 0x7f) << 8) | buffer[offset + 1], buffer[offset + 2]);
-                offset += 3;
-                break;
-
-            case 0x70:
-            case 0x71:
-            case 0x72:
-            case 0x73:
-            case 0x74:
-            case 0x75:
-            case 0x76:
-            case 0x77:
-            case 0x78:
-            case 0x79:
-            case 0x7a:
-            case 0x7b:
-            case 0x7c:
-            case 0x7d:
-            case 0x7e:
-            case 0x7f:
-                delay = (cmd & 15) + 1;
-                break;
-
-            case 0x80:
-            case 0x81:
-            case 0x82:
-            case 0x83:
-            case 0x84:
-            case 0x85:
-            case 0x86:
-            case 0x87:
-            case 0x88:
-            case 0x89:
-            case 0x8a:
-            case 0x8b:
-            case 0x8c:
-            case 0x8d:
-            case 0x8e:
-            case 0x8f: {
-                vgm_chip_base *chip = find_chip(CHIP_YM2612, 0);
-                if (chip != nullptr)
-                    chip->write(0x2a, chip->read_pcm());
-                delay = cmd & 15;
-                break;
+            if(delay) {
+                int32_t outputs[2] = {0};
+                for (auto &chip: active_chips) {
+                    chip->generate(output_pos, output_step, outputs);
+                }
+                output_pos += output_step;
+                fill[i] = int32_to_float(outputs[0] *1.5);
+                fill[i + 1] = int32_to_float(outputs[1]*1.5);
+                delay--;
             }
 
-                // ignored, consume one byte
-            case 0x30:
-            case 0x31:
-            case 0x32:
-            case 0x33:
-            case 0x34:
-            case 0x35:
-            case 0x36:
-            case 0x37:
-            case 0x38:
-            case 0x39:
-            case 0x3a:
-            case 0x3b:
-            case 0x3c:
-            case 0x3d:
-            case 0x3e:
-            case 0x3f:
-            case 0x4f:    // dd: Game Gear PSG stereo, write dd to port 0x06
-            case 0x50:    // dd: PSG (SN76489/SN76496) write value dd
-                offset++;
-                break;
-
-                // ignored, consume two bytes
-            case 0x40:
-            case 0x41:
-            case 0x42:
-            case 0x43:
-            case 0x44:
-            case 0x45:
-            case 0x46:
-            case 0x47:
-            case 0x48:
-            case 0x49:
-            case 0x4a:
-            case 0x4b:
-            case 0x4c:
-            case 0x4d:
-            case 0x4e:
-            case 0x5d:    // aa dd: YMZ280B, write value dd to register aa
-            case 0xb0:    // aa dd: RF5C68, write value dd to register aa
-            case 0xb1:    // aa dd: RF5C164, write value dd to register aa
-            case 0xb2:    // aa dd: PWM, write value ddd to register a (d is MSB, dd is LSB)
-            case 0xb3:    // aa dd: GameBoy DMG, write value dd to register aa
-            case 0xb4:    // aa dd: NES APU, write value dd to register aa
-            case 0xb5:    // aa dd: MultiPCM, write value dd to register aa
-            case 0xb6:    // aa dd: uPD7759, write value dd to register aa
-            case 0xb7:    // aa dd: OKIM6258, write value dd to register aa
-            case 0xb8:    // aa dd: OKIM6295, write value dd to register aa
-            case 0xb9:    // aa dd: HuC6280, write value dd to register aa
-            case 0xba:    // aa dd: K053260, write value dd to register aa
-            case 0xbb:    // aa dd: Pokey, write value dd to register aa
-            case 0xbc:    // aa dd: WonderSwan, write value dd to register aa
-            case 0xbd:    // aa dd: SAA1099, write value dd to register aa
-            case 0xbe:    // aa dd: ES5506, write value dd to register aa
-            case 0xbf:    // aa dd: GA20, write value dd to register aa
-                offset += 2;
-                break;
-
-                // ignored, consume three bytes
-            case 0xc9:
-            case 0xca:
-            case 0xcb:
-            case 0xcc:
-            case 0xcd:
-            case 0xce:
-            case 0xcf:
-            case 0xd7:
-            case 0xd8:
-            case 0xd9:
-            case 0xda:
-            case 0xdb:
-            case 0xdc:
-            case 0xdd:
-            case 0xde:
-            case 0xdf:
-            case 0xc0:    // bbaa dd: Sega PCM, write value dd to memory offset aabb
-            case 0xc1:    // bbaa dd: RF5C68, write value dd to memory offset aabb
-            case 0xc2:    // bbaa dd: RF5C164, write value dd to memory offset aabb
-            case 0xc3:    // cc bbaa: MultiPCM, write set bank offset aabb to channel cc
-            case 0xc4:    // mmll rr: QSound, write value mmll to register rr (mm - data MSB, ll - data LSB)
-            case 0xc5:    // mmll dd: SCSP, write value dd to memory offset mmll (mm - offset MSB, ll - offset LSB)
-            case 0xc6:    // mmll dd: WonderSwan, write value dd to memory offset mmll (mm - offset MSB, ll - offset LSB)
-            case 0xc7:    // mmll dd: VSU, write value dd to memory offset mmll (mm - offset MSB, ll - offset LSB)
-            case 0xc8:    // mmll dd: X1-010, write value dd to memory offset mmll (mm - offset MSB, ll - offset LSB)
-            case 0xd1:    // pp aa dd: YMF271, port pp, write value dd to register aa
-            case 0xd2:    // pp aa dd: SCC1, port pp, write value dd to register aa
-            case 0xd3:    // pp aa dd: K054539, write value dd to register ppaa
-            case 0xd4:    // pp aa dd: C140, write value dd to register ppaa
-            case 0xd5:    // pp aa dd: ES5503, write value dd to register ppaa
-            case 0xd6:    // pp aa dd: ES5506, write value aadd to register pp
-                offset += 3;
-                break;
-
-                // ignored, consume four bytes
-            case 0xe0:    // dddddddd: Seek to offset dddddddd (Intel byte order) in PCM data bank of data block type 0 (YM2612).
-            {
-                vgm_chip_base *chip = find_chip(CHIP_YM2612, 0);
-                uint32_t pos = parse_uint32(buffer, offset);
-                if (chip != nullptr)
-                    chip->seek_pcm(pos);
-                offset += 4;
-                break;
-            }
-            case 0xe1:    // mmll aadd: C352, write value aadd to register mmll
-            case 0xe2:
-            case 0xe3:
-            case 0xe4:
-            case 0xe5:
-            case 0xe6:
-            case 0xe7:
-            case 0xe8:
-            case 0xe9:
-            case 0xea:
-            case 0xeb:
-            case 0xec:
-            case 0xed:
-            case 0xee:
-            case 0xef:
-            case 0xf0:
-            case 0xf1:
-            case 0xf2:
-            case 0xf3:
-            case 0xf4:
-            case 0xf5:
-            case 0xf6:
-            case 0xf7:
-            case 0xf8:
-            case 0xf9:
-            case 0xfa:
-            case 0xfb:
-            case 0xfc:
-            case 0xfd:
-            case 0xfe:
-            case 0xff:
-                offset += 4;
-                break;
-
-            default:
-                LOG_E("Unhandled command! 0x%02X at %08X",cmd,offset);
         }
     }
 }
 
-uint32_t data_start;
-std::vector<uint8_t> buffer;
+
 
 
 class MyCallback : public oboe::AudioStreamDataCallback {
@@ -1140,8 +1182,10 @@ public:
 
         auto *outData = static_cast<float *>(audioData);
 
-        for(int i=0; i<numFrames; ++i)
-            generate_tick(buffer, data_start, 44100, (float *)(outData + i*2));
+        LOG_D("numFrames %d bpf %d fpb %d bps %d",numFrames,audioStream->getBytesPerFrame(),audioStream->getFramesPerBurst(),audioStream->getBytesPerSample())
+        //for(int i=0; i<numFrames; ++i)
+        //generate_tick(buffer, data_start, 44100, (float *)(outData + i*2),numFrames);
+        generate_tick(buffer, data_start, 44100, outData,numFrames*2);
 
         return oboe::DataCallbackResult::Continue;
     }
@@ -1164,15 +1208,19 @@ Java_team_digitalfairy_ymfm_1thing_YmfmInterface_startOboe(JNIEnv *env, jclass c
     mMyCallback = std::make_shared<MyCallback>();
     mErrorCallback = std::make_shared<ErrorCallback>();
 
+    //oboe::DefaultStreamValues::FramesPerBurst = 1056;
+
     oboe::AudioStreamBuilder b;
 
     b.setDirection(oboe::Direction::Output);
-    b.setPerformanceMode(oboe::PerformanceMode::None);
+    b.setPerformanceMode(oboe::PerformanceMode::LowLatency);
     b.setSharingMode(oboe::SharingMode::Exclusive);
-    b.setBufferCapacityInFrames(1024);
+    //b.setFramesPerDataCallback(4096);
+    b.setSampleRateConversionQuality(oboe::SampleRateConversionQuality::Best);
+    //b.setBufferCapacityInFrames(2400);
     b.setFormat(oboe::AudioFormat::Float);
     b.setSampleRate(44100);
-    b.setAudioApi(oboe::AudioApi::AAudio);
+    //b.setAudioApi(oboe::AudioApi::OpenSLES);
 
     //b.setChannelCount(oboe::ChannelCount::Mono);
 
@@ -1181,7 +1229,11 @@ Java_team_digitalfairy_ymfm_1thing_YmfmInterface_startOboe(JNIEnv *env, jclass c
 
     oboe::Result r = b.openStream(mStream);
 
-    FILE *fp = fopen("/data/local/tmp/ym2608_4op_sign_wave.vgm","rb");
+    LOG_I("Ready")
+    LOG_I("API = %s",mStream->getAudioApi() == oboe::AudioApi::AAudio?"AAudio":"OpenSLES");
+    LOG_I("Format = %s",mStream->getFormat() == oboe::AudioFormat::I16?"I16":"Float");
+
+    FILE *fp = fopen("/data/local/tmp/test.vgm","rb");
     if(fp == nullptr) {
         LOG_E("Error: File open failure %d %s",errno, strerror(errno));
         return;

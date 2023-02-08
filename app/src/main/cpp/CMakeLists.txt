@@ -54,6 +54,11 @@ find_package(
 # can link multiple libraries, such as libraries you define in this
 # build script, prebuilt third-party libraries, or system libraries.
 
+target_compile_options(ymfm PRIVATE
+        "$<$<CONFIG:RELEASE>:-O3>"
+        "$<$<CONFIG:DEBUG>:-O3>"
+        )
+
 target_link_libraries( # Specifies the target library.
                        ymfm_thing
 

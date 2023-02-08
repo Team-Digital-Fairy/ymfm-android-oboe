@@ -2,6 +2,9 @@ cmake_minimum_required(VERSION 3.0)
 
 project(ymfm CXX)
 
+
+
+
 add_library(ymfm
 	STATIC
 	src/ymfm_adpcm.cpp
