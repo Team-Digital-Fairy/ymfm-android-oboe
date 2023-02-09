@@ -32,7 +32,7 @@ public class MainActivity extends AppCompatActivity {
         intent.setAction(Intent.ACTION_OPEN_DOCUMENT_TREE);
         startActivity(intent);
         */
-
+        YmfmInterface.startOboe();
 
     }
 
@@ -40,6 +40,6 @@ public class MainActivity extends AppCompatActivity {
     protected void onResume() {
         super.onResume();
 
-        YmfmInterface.startOboe();
+
     }
 }

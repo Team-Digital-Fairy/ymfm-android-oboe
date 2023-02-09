@@ -30,9 +30,9 @@ using emulated_time = uint64_t;
 
 // VGM Datas
 
-uint32_t data_start;
+uint32_t vgm_data_start;
 uint32_t loop_offset;
-std::vector<uint8_t> buffer;
+std::vector<uint8_t> vgm_buffer;
 
 
 enum chip_type
@@ -270,7 +270,6 @@ uint32_t parse_uint32(std::vector<uint8_t> &buffer, uint32_t &offset)
     return result;
 }
 
-
 template<typename ChipType>
 void add_chips(uint32_t clock, chip_type type, char const *chipname)
 {
@@ -377,10 +376,10 @@ uint32_t parse_header(std::vector<uint8_t> &buffer) {
         add_chips<ymfm::ym2151>(clock, CHIP_YM2151, "YM2151");
 
     // +34: VGM data offset
-    uint32_t ds = parse_uint32(buffer, offset);
-    ds += offset - 4;
+    uint32_t data_start = parse_uint32(buffer, offset);
+    data_start += offset - 4;
     if (version < 0x150)
-        ds = 0x40;
+        data_start = 0x40;
 
     // +38: Sega PCM clock
     clock = parse_uint32(buffer, offset);
@@ -712,8 +711,39 @@ float int32_to_float(int32_t value) {
 
 inline int16_t int32_to_int16(int32_t value) {
     // preserve signedness
-   return (int16_t)(value / 32767);
+    return (int16_t)(value / 32767);
 }
+
+typedef struct {
+    uint8_t streamId;
+    uint8_t chipType; // YM2612 = 0x02
+    uint8_t command;
+    uint8_t reg;
+
+    bool isRunning;
+
+    uint8_t dataBank;
+
+    uint8_t stepBase;
+    uint8_t stepSize;
+
+    uint32_t streamFrequency; // convert to timing map and use delta time in frame step?
+
+    uint32_t frameStep; // how many steps does it need to be written. (probably need more finer granularity?)
+
+    uint8_t streamFlag; // TODO: support more mode
+
+} dacStream_t;
+
+typedef struct {
+    uint32_t location;
+    uint32_t size;
+} blockData_t;
+
+dacStream_t dacStreams[0xFE] = {0};
+blockData_t blockPtrs[0xFF] = {0};
+uint8_t blockCounters = 0;
+uint8_t blockLength = 0;
 
 void generate_tick(std::vector<uint8_t> &buffer, uint32_t data_start, uint32_t output_rate, float *fill, size_t fill_size) {
     static uint32_t offset = data_start;
@@ -722,26 +752,14 @@ void generate_tick(std::vector<uint8_t> &buffer, uint32_t data_start, uint32_t o
     static emulated_time output_pos = 0;
 
     for(int i=0; i<fill_size; i+=2) {
-        if(delay != 0) {
-            int32_t outputs[2] = {0};
-            for (auto &chip: active_chips) {
-                chip->generate(output_pos, output_step, outputs);
-            }
-            output_pos += output_step;
-            fill[i] = int32_to_float(outputs[0] * 1.5);
-            fill[i+1] = int32_to_float(outputs[1] * 1.5);
-            delay--;
-            continue;
+        if (done) {
+            offset = loop_offset;
+            done = false;
         }
-
+        if (offset + 1 >= buffer.size()) return;
         while (delay <= 0) {
-            if (done) {
-                offset = loop_offset;
-                done = false;
-            }
-            if (offset + 1 >= buffer.size()) return;
             uint8_t cmd = buffer[offset++];
-
+            //LOG_D("Next Cmd %02X",cmd);
             switch (cmd) {
                 // YM2413, write value dd to register aa
                 case 0x51:
@@ -887,10 +905,20 @@ void generate_tick(std::vector<uint8_t> &buffer, uint32_t data_start, uint32_t o
 
                         case 0x00: // YM2612 PCM data for use with associated commands
                         {
+                            blockPtrs[blockCounters].size = size;
+                            if(blockCounters == 0) {
+                                blockPtrs[blockCounters].location = 0;
+                            } else {
+                                blockPtrs[blockCounters].location = blockPtrs[blockCounters-1].location + blockPtrs[blockCounters].size;
+                            }
+                            LOG_I("Found YM2612 datablock; ptr is %08X; assigned to blockIdx %04X as loc %08X size %08X",localoffset,blockCounters,blockPtrs[blockCounters].location,blockPtrs[blockCounters].size);
+                            // fixme: Very optimistic implementation; if VGM data doesn't have their data in linear, it won't work!
                             vgm_chip_base *chip = find_chip(CHIP_YM2612, 0);
                             if (chip != nullptr)
                                 chip->write_data(ymfm::ACCESS_PCM, 0, size - 8,
                                                  &buffer[localoffset]);
+
+                            blockCounters++;
                             break;
                         }
 
@@ -1153,21 +1181,90 @@ void generate_tick(std::vector<uint8_t> &buffer, uint32_t data_start, uint32_t o
                     offset += 4;
                     break;
 
-                default:
-                    LOG_E("Unhandled command! 0x%02X at %08X", cmd, offset);
-            }
-
-            if(delay) {
-                int32_t outputs[2] = {0};
-                for (auto &chip: active_chips) {
-                    chip->generate(output_pos, output_step, outputs);
+                case 0x90: {
+                    // Setup Stream
+                    uint8_t streamId = buffer[offset];
+                    uint8_t chipType = buffer[offset + 1]; // Find chip via chipType
+                    uint8_t setCmd = buffer[offset + 2];
+                    uint8_t reg = buffer[offset + 3];
+                    LOG_I("Setup Stream %02X, ct %d writeStream at %02X:%02X", streamId, chipType,
+                          setCmd, reg);
+                    dacStreams[streamId].streamId = streamId;
+                    dacStreams[streamId].chipType = chipType;
+                    dacStreams[streamId].command = setCmd;
+                    dacStreams[streamId].reg = reg;
+                    offset += 4;
+                    break;
                 }
-                output_pos += output_step;
-                fill[i] = int32_to_float(outputs[0] *1.5);
-                fill[i + 1] = int32_to_float(outputs[1]*1.5);
-                delay--;
-            }
+                case 0x91: {
+                    // Set Stream Data
+                    uint8_t streamId = buffer[offset];
+                    uint8_t dataBankId = buffer[offset + 1]; // Find chip via chipType; which datablock id should this stream look into?
+                    uint8_t stepSize = buffer[offset + 2];
+                    uint8_t stepBase = buffer[offset + 3];
 
+                    dacStreams[streamId].stepBase = stepBase;
+                    dacStreams[streamId].stepSize = stepSize;
+
+                    LOG_I("Set Stream %02X, dbId %d  stepSize %d stepBase %d", streamId, dataBankId,
+                          stepSize, stepBase);
+                    offset += 4;
+                    break;
+                }
+                case 0x92: {
+                    // Stream freq
+                    uint8_t streamId = buffer[offset];
+                    offset += 1;
+                    uint32_t freq = parse_uint32(buffer, offset);
+                    LOG_I("cmd at f%08X streamId %02X Set Stream Freq at %08dHz", offset, streamId, freq);
+                    //offset += 4;
+                    break;
+                }
+                case 0x93: {
+                    // Start Stream
+                    uint8_t streamId = buffer[offset];
+                    offset += 1;
+                    uint32_t ds_offset = parse_uint32(buffer,offset);
+                    //offset += 4;
+                    uint8_t lengthMode = buffer[offset];
+                    offset += 1;
+                    uint32_t dataLength = parse_uint32(buffer,offset);
+                    //offset += 4; // 10
+
+                    LOG_I("cmd at f%08X Start Stream %02X, startOfs %08X len %08X, with Mode %02X", offset, streamId,
+                          ds_offset,dataLength,lengthMode);
+                    break;
+                }
+                case 0x94:
+                    // Stop stream 0xFF = stop
+                    LOG_I("Stop Stream %02X", buffer[offset++]);
+                    break;
+
+                case 0x95: {
+                    // fast call Start Stream
+                    uint8_t streamId = buffer[offset];
+                    uint16_t blockId = buffer[offset+2] << 8 | buffer[offset+1];
+                    uint8_t flags = buffer[offset+3];
+
+                    LOG_I("Fast start Stream %02X, with blockId %04X (at %08X), flags %02X",
+                          streamId,blockId,blockPtrs[blockId].location,flags);
+                    offset += 4;
+                    break;
+                }
+
+                default:
+                    LOG_E("Unhandled command! 0x%02X at %08X", cmd, offset-1);
+            }
+        }
+        if(delay) {
+            int32_t outputs[2] = {0};
+            for (auto &chip: active_chips) {
+                chip->generate(output_pos, output_step, outputs);
+            }
+            output_pos += output_step;
+            fill[i] = int32_to_float(outputs[0] *1.5);
+            fill[i + 1] = int32_to_float(outputs[1]*1.5);
+            delay--;
         }
     }
 }
@@ -1182,10 +1279,10 @@ public:
 
         auto *outData = static_cast<float *>(audioData);
 
-        LOG_D("numFrames %d bpf %d fpb %d bps %d",numFrames,audioStream->getBytesPerFrame(),audioStream->getFramesPerBurst(),audioStream->getBytesPerSample())
+        //LOG_D("numFrames %d bpf %d fpb %d bps %d",numFrames,audioStream->getBytesPerFrame(),audioStream->getFramesPerBurst(),audioStream->getBytesPerSample())
         //for(int i=0; i<numFrames; ++i)
         //generate_tick(buffer, data_start, 44100, (float *)(outData + i*2),numFrames);
-        generate_tick(buffer, data_start, 44100, outData,numFrames*2);
+        generate_tick(vgm_buffer, vgm_data_start, 44100, outData,numFrames*2);
 
         return oboe::DataCallbackResult::Continue;
     }
@@ -1242,15 +1339,15 @@ Java_team_digitalfairy_ymfm_1thing_YmfmInterface_startOboe(JNIEnv *env, jclass c
     fseek(fp, 0, SEEK_END);
     uint32_t sz = ftell(fp);
     rewind(fp);
-    buffer = std::vector<uint8_t>(sz);
+    vgm_buffer = std::vector<uint8_t>(sz);
 
-    auto bytes_read = fread(&buffer[0],1,sz,fp);
+    auto bytes_read = fread(&vgm_buffer[0],1,sz,fp);
     // TODO: Error check
     // TODO: Decompress Gzip on memory
 
     fclose(fp);
 
-    data_start = parse_header(buffer);
+    vgm_data_start = parse_header(vgm_buffer);
 
     // we are ready for actual output!
 
