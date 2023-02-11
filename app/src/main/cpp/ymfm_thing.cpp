@@ -2,6 +2,12 @@
 #include <error.h>
 #include <algorithm>
 
+//#include <mutex>
+#include <pthread.h>
+#include <ctime>
+#include <unistd.h>
+#include <cmath>
+
 // ymfm thing
 #include "ymfm.h"
 #include "ymfm_misc.h"
@@ -691,8 +697,6 @@ void add_rom_data(chip_type type, ymfm::access_class access, std::vector<uint8_t
 }
 
 
-int delay = 0;
-#include <cmath>
 
 float clamp_to_one(float in) {
     return fminf(fmaxf(in, -1.0f), 1.0f);
@@ -728,11 +732,21 @@ typedef struct {
     uint8_t stepSize;
 
     uint32_t streamFrequency; // convert to timing map and use delta time in frame step?
+    double frequencyInus; // (1/streamFrequency)*1000*1000
 
     uint32_t frameStep; // how many steps does it need to be written. (probably need more finer granularity?)
 
     uint8_t streamFlag; // TODO: support more mode
 
+    bool isFastRun; // True if it should use blockId to look up
+    uint16_t blockId; // block ID to look up in blockPtrs
+
+    bool restart; // Restart stream with new settings
+
+    // PRIVATE
+    double _currentTime; // how many us had past
+    bool _running; // is it actually in handling code?
+    uint64_t _currentPosition;
 } dacStream_t;
 
 typedef struct {
@@ -740,10 +754,13 @@ typedef struct {
     uint32_t size;
 } blockData_t;
 
-dacStream_t dacStreams[0xFE] = {0};
-blockData_t blockPtrs[0xFF] = {0};
+int delay = 0;
+static pthread_mutex_t dacStreamLock;
+static dacStream_t dacStreams[4] = {0}; // TODO: Optimization. I do not think if there's stream that spans more than 32.
+static blockData_t blockPtrs[0xFF] = {0};
+auto pcmBuffer = std::vector<uint8_t>();
 uint8_t blockCounters = 0;
-uint8_t blockLength = 0;
+uint64_t nextBlockLoc = 0;
 
 void generate_tick(std::vector<uint8_t> &buffer, uint32_t data_start, uint32_t output_rate, float *fill, size_t fill_size) {
     static uint32_t offset = data_start;
@@ -752,12 +769,12 @@ void generate_tick(std::vector<uint8_t> &buffer, uint32_t data_start, uint32_t o
     static emulated_time output_pos = 0;
 
     for(int i=0; i<fill_size; i+=2) {
-        if (done) {
-            offset = loop_offset;
-            done = false;
-        }
-        if (offset + 1 >= buffer.size()) return;
         while (delay <= 0) {
+            if (done) {
+                offset = loop_offset;
+                done = false;
+            }
+            if (offset + 1 >= buffer.size()) return;
             uint8_t cmd = buffer[offset++];
             //LOG_D("Next Cmd %02X",cmd);
             switch (cmd) {
@@ -909,8 +926,11 @@ void generate_tick(std::vector<uint8_t> &buffer, uint32_t data_start, uint32_t o
                             if(blockCounters == 0) {
                                 blockPtrs[blockCounters].location = 0;
                             } else {
-                                blockPtrs[blockCounters].location = blockPtrs[blockCounters-1].location + blockPtrs[blockCounters].size;
+                                blockPtrs[blockCounters].location = nextBlockLoc;
                             }
+                            nextBlockLoc += blockPtrs[blockCounters].size + 1;
+                            pcmBuffer.insert(pcmBuffer.end(),buffer[localoffset],size-8);
+
                             LOG_I("Found YM2612 datablock; ptr is %08X; assigned to blockIdx %04X as loc %08X size %08X",localoffset,blockCounters,blockPtrs[blockCounters].location,blockPtrs[blockCounters].size);
                             // fixme: Very optimistic implementation; if VGM data doesn't have their data in linear, it won't work!
                             vgm_chip_base *chip = find_chip(CHIP_YM2612, 0);
@@ -1189,10 +1209,12 @@ void generate_tick(std::vector<uint8_t> &buffer, uint32_t data_start, uint32_t o
                     uint8_t reg = buffer[offset + 3];
                     LOG_I("Setup Stream %02X, ct %d writeStream at %02X:%02X", streamId, chipType,
                           setCmd, reg);
+                    pthread_mutex_lock(&dacStreamLock);;
                     dacStreams[streamId].streamId = streamId;
                     dacStreams[streamId].chipType = chipType;
                     dacStreams[streamId].command = setCmd;
                     dacStreams[streamId].reg = reg;
+                    pthread_mutex_unlock(&dacStreamLock);;
                     offset += 4;
                     break;
                 }
@@ -1203,8 +1225,10 @@ void generate_tick(std::vector<uint8_t> &buffer, uint32_t data_start, uint32_t o
                     uint8_t stepSize = buffer[offset + 2];
                     uint8_t stepBase = buffer[offset + 3];
 
+                    pthread_mutex_lock(&dacStreamLock);;
                     dacStreams[streamId].stepBase = stepBase;
                     dacStreams[streamId].stepSize = stepSize;
+                    pthread_mutex_unlock(&dacStreamLock);;
 
                     LOG_I("Set Stream %02X, dbId %d  stepSize %d stepBase %d", streamId, dataBankId,
                           stepSize, stepBase);
@@ -1216,7 +1240,12 @@ void generate_tick(std::vector<uint8_t> &buffer, uint32_t data_start, uint32_t o
                     uint8_t streamId = buffer[offset];
                     offset += 1;
                     uint32_t freq = parse_uint32(buffer, offset);
-                    LOG_I("cmd at f%08X streamId %02X Set Stream Freq at %08dHz", offset, streamId, freq);
+
+                    pthread_mutex_lock(&dacStreamLock);
+                    dacStreams[streamId].frequencyInus = (1.0/freq) * 1000 * 1000;
+                    dacStreams[streamId].streamFrequency = freq;
+                    pthread_mutex_unlock(&dacStreamLock);
+                    LOG_I("cmd at f%08X streamId %02X Set Stream Freq at %08dHz; playing at %lf", offset, streamId, freq, dacStreams[streamId].frequencyInus);
                     //offset += 4;
                     break;
                 }
@@ -1231,13 +1260,20 @@ void generate_tick(std::vector<uint8_t> &buffer, uint32_t data_start, uint32_t o
                     uint32_t dataLength = parse_uint32(buffer,offset);
                     //offset += 4; // 10
 
+                    // TODO: SUPPORT THIS COMMAND
+                    pthread_mutex_lock(&dacStreamLock);;
+                    pthread_mutex_unlock(&dacStreamLock);;
                     LOG_I("cmd at f%08X Start Stream %02X, startOfs %08X len %08X, with Mode %02X", offset, streamId,
                           ds_offset,dataLength,lengthMode);
                     break;
                 }
                 case 0x94:
-                    // Stop stream 0xFF = stop
-                    LOG_I("Stop Stream %02X", buffer[offset++]);
+                    // Stop stream 0xFF = stop all
+                    pthread_mutex_lock(&dacStreamLock);;
+                    dacStreams[buffer[offset]].isRunning = false;
+                    pthread_mutex_unlock(&dacStreamLock);;
+                    LOG_I("Stop Stream %02X", buffer[offset]);
+                    offset++;
                     break;
 
                 case 0x95: {
@@ -1246,6 +1282,12 @@ void generate_tick(std::vector<uint8_t> &buffer, uint32_t data_start, uint32_t o
                     uint16_t blockId = buffer[offset+2] << 8 | buffer[offset+1];
                     uint8_t flags = buffer[offset+3];
 
+                    pthread_mutex_lock(&dacStreamLock);;
+                    dacStreams[streamId].blockId = blockId;
+                    dacStreams[streamId].streamFlag = flags;
+                    dacStreams[streamId].isRunning = true;
+                    dacStreams[streamId].restart = true;
+                    pthread_mutex_unlock(&dacStreamLock);
                     LOG_I("Fast start Stream %02X, with blockId %04X (at %08X), flags %02X",
                           streamId,blockId,blockPtrs[blockId].location,flags);
                     offset += 4;
@@ -1269,6 +1311,53 @@ void generate_tick(std::vector<uint8_t> &buffer, uint32_t data_start, uint32_t o
     }
 }
 
+void *timer_handler(void *arg) {
+    // check through
+    struct sched_param param;
+    param.sched_priority = sched_get_priority_max(SCHED_FIFO);
+
+    struct timespec interval{};
+    interval.tv_sec = 0;
+    interval.tv_nsec = 500;
+
+    while(true) {
+        pthread_mutex_lock(&dacStreamLock);
+        for (auto & dacStream : dacStreams) {
+            dacStream_t *dtr = &dacStream;
+            if (!dtr->_running || dtr->restart) {
+                //LOG_I("Thread: Got streamId %02X running!",i);
+                // if it's JUST triggered
+
+                dtr->_running = true;
+                dtr->_currentTime = dtr->frequencyInus;
+                dtr->_currentPosition = blockPtrs[dtr->streamId].location;
+            }
+            if (dtr->_running) {
+                // handling current sample
+                if((dtr->_currentTime -= 0.5) < 0) {
+                    if(dtr->_currentPosition >= blockPtrs[dtr->streamId].location + blockPtrs[dtr->streamId].size) {
+                        dtr->_running = false;
+                        dtr->isRunning = false;
+                        continue;
+                    }
+                    // process frame immediate and set time again;
+                    //
+
+                    // put sample
+                    vgm_chip_base* base = find_chip(CHIP_YM2612,0);
+                    base->seek_pcm(dtr->_currentPosition++);
+                    base->write(0x2a,base->read_pcm() & 0x7F);
+                    if(dtr->_currentTime <= 0.0) dtr->_currentTime = dtr->frequencyInus;
+                    // TODO:: PROPERLY IMPLEMENT
+                }
+            }
+
+        }
+        pthread_mutex_unlock(&dacStreamLock);
+        nanosleep(&interval, nullptr);
+    }
+    return nullptr;
+}
 
 
 
@@ -1304,6 +1393,8 @@ JNIEXPORT void JNICALL
 Java_team_digitalfairy_ymfm_1thing_YmfmInterface_startOboe(JNIEnv *env, jclass clazz) {
     mMyCallback = std::make_shared<MyCallback>();
     mErrorCallback = std::make_shared<ErrorCallback>();
+
+    pthread_mutex_init(&dacStreamLock, nullptr);
 
     //oboe::DefaultStreamValues::FramesPerBurst = 1056;
 
@@ -1349,8 +1440,29 @@ Java_team_digitalfairy_ymfm_1thing_YmfmInterface_startOboe(JNIEnv *env, jclass c
 
     vgm_data_start = parse_header(vgm_buffer);
 
-    // we are ready for actual output!
+    // Make timer to scan through DACStream
 
+
+    int result = pthread_create(&pthr, nullptr, timer_handler, nullptr);
+    /*
+    timer_t timer;
+    struct sigaction sa{};
+    struct itimerspec itimer{};
+
+    sa.sa_flags = SA_RESTART;
+    sa.sa_handler = timer_handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGALRM, &sa, nullptr);
+
+    timer_create(CLOCK_REALTIME, nullptr,&timer);
+    itimer.it_value.tv_sec = 0;
+    itimer.it_value.tv_nsec = 5000; // 1us
+    itimer.it_interval.tv_sec = 0;
+    itimer.it_interval.tv_nsec = 5000;
+
+    timer_settime(timer, 0, &itimer, nullptr);
+    */
+    // we are ready for actual output!
     r = mStream->requestStart();
 
 
