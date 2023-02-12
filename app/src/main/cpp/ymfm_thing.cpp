@@ -7,6 +7,7 @@
 #include <ctime>
 #include <unistd.h>
 #include <cmath>
+#include <deque>
 
 // ymfm thing
 #include "ymfm.h"
@@ -732,7 +733,9 @@ typedef struct {
     uint8_t stepSize;
 
     uint32_t streamFrequency; // convert to timing map and use delta time in frame step?
+    uint64_t streamPeriod;
     double frequencyInus; // (1/streamFrequency)*1000*1000
+
 
     uint32_t frameStep; // how many steps does it need to be written. (probably need more finer granularity?)
 
@@ -749,18 +752,33 @@ typedef struct {
     uint64_t _currentPosition;
 } dacStream_t;
 
+#include <list>
+
 typedef struct {
     uint32_t location;
     uint32_t size;
+    std::list<uint8_t> fifo;
 } blockData_t;
 
 int delay = 0;
 static pthread_mutex_t dacStreamLock;
-static dacStream_t dacStreams[4] = {0}; // TODO: Optimization. I do not think if there's stream that spans more than 32.
+static dacStream_t dacStreams[2] = {0}; // TODO: Optimization. I do not think if there's stream that spans more than 32.
 static blockData_t blockPtrs[0xFF] = {0};
-auto pcmBuffer = std::vector<uint8_t>();
+//auto pcmBuffer = std::vector<uint8_t>();
 uint8_t blockCounters = 0;
 uint64_t nextBlockLoc = 0;
+
+/*
+void handlePCMWrite() {
+    for(int i=0; i<4; i++) {
+        dacStream_t* dac = &dacStreams[i];
+
+        if(dac->isRunning) {
+
+        }
+
+    }
+}*/
 
 void generate_tick(std::vector<uint8_t> &buffer, uint32_t data_start, uint32_t output_rate, float *fill, size_t fill_size) {
     static uint32_t offset = data_start;
@@ -769,6 +787,11 @@ void generate_tick(std::vector<uint8_t> &buffer, uint32_t data_start, uint32_t o
     static emulated_time output_pos = 0;
 
     for(int i=0; i<fill_size; i+=2) {
+        //handlePCMWrite();
+        //handlePCMWrite();
+        //handlePCMWrite();
+        //handlePCMWrite();
+
         while (delay <= 0) {
             if (done) {
                 offset = loop_offset;
@@ -922,6 +945,7 @@ void generate_tick(std::vector<uint8_t> &buffer, uint32_t data_start, uint32_t o
 
                         case 0x00: // YM2612 PCM data for use with associated commands
                         {
+                            pthread_mutex_lock(&dacStreamLock);
                             blockPtrs[blockCounters].size = size;
                             if(blockCounters == 0) {
                                 blockPtrs[blockCounters].location = 0;
@@ -929,10 +953,14 @@ void generate_tick(std::vector<uint8_t> &buffer, uint32_t data_start, uint32_t o
                                 blockPtrs[blockCounters].location = nextBlockLoc;
                             }
                             nextBlockLoc += blockPtrs[blockCounters].size + 1;
-                            pcmBuffer.insert(pcmBuffer.end(),buffer[localoffset],size-8);
-
+                            //blockPtrs[blockCounters].fifo  new std::deque<uint8_t>();
+                            //blockPtrs[blockCounters].fifo.resize(size);
+                            std::copy_n(&buffer[localoffset],size,std::back_inserter(blockPtrs[blockCounters].fifo));
+                            //blockPtrs[blockCounters].fifo.insert(blockPtrs[blockCounters].fifo.end(),buffer[localoffset],size);
+                            pthread_mutex_unlock(&dacStreamLock);
                             LOG_I("Found YM2612 datablock; ptr is %08X; assigned to blockIdx %04X as loc %08X size %08X",localoffset,blockCounters,blockPtrs[blockCounters].location,blockPtrs[blockCounters].size);
                             // fixme: Very optimistic implementation; if VGM data doesn't have their data in linear, it won't work!
+                            // fixme: Chip detection is bad
                             vgm_chip_base *chip = find_chip(CHIP_YM2612, 0);
                             if (chip != nullptr)
                                 chip->write_data(ymfm::ACCESS_PCM, 0, size - 8,
@@ -1243,6 +1271,7 @@ void generate_tick(std::vector<uint8_t> &buffer, uint32_t data_start, uint32_t o
 
                     pthread_mutex_lock(&dacStreamLock);
                     dacStreams[streamId].frequencyInus = (1.0/freq) * 1000 * 1000;
+                    //dacStreams[streamId].streamPeriod =
                     dacStreams[streamId].streamFrequency = freq;
                     pthread_mutex_unlock(&dacStreamLock);
                     LOG_I("cmd at f%08X streamId %02X Set Stream Freq at %08dHz; playing at %lf", offset, streamId, freq, dacStreams[streamId].frequencyInus);
@@ -1311,30 +1340,86 @@ void generate_tick(std::vector<uint8_t> &buffer, uint32_t data_start, uint32_t o
     }
 }
 
+
+typedef struct {
+    bool running;
+    double timer;
+    double runningTime;
+    uint16_t pcmPtr;
+
+    // Actual ptrs
+    uint64_t size;
+    uint64_t ptr;
+
+} inStream_t;
+
 void *timer_handler(void *arg) {
     // check through
-    struct sched_param param;
-    param.sched_priority = sched_get_priority_max(SCHED_FIFO);
-
+    inStream_t threadStream[4];
     struct timespec interval{};
     interval.tv_sec = 0;
-    interval.tv_nsec = 500;
+    interval.tv_nsec = 1000;
+
+    while(true) {
+        for (auto & dacStream : dacStreams) {
+            pthread_mutex_lock(&dacStreamLock);
+            dacStream_t *dtr = &dacStream;
+            uint16_t id = dtr->streamId;
+            if(dtr->isRunning && dtr->restart) {
+                threadStream[id].running = true;
+                threadStream[id].pcmPtr = dtr->blockId;
+                dtr->restart = false;
+                threadStream[id].timer = threadStream[id].runningTime = 8.0;
+            }
+            pthread_mutex_unlock(&dacStreamLock);
+
+
+            if(threadStream[id].running) {
+                if((threadStream[id].runningTime -= 1.0) <= 0.0) {
+                    if (blockPtrs[id].fifo.empty()) {
+                        threadStream[id].running = false;
+                        LOG_D("Stream %d finished",id);
+                        continue;
+                    }
+                    write_chip(CHIP_YM2612, 0, 0x2a, blockPtrs[threadStream[id].pcmPtr].fifo.front() * 1.2);
+                    blockPtrs[threadStream[id].pcmPtr].fifo.pop_front();
+
+                    threadStream[id].runningTime = threadStream[id].timer;
+                }
+            }
+
+
+        }
+
+        nanosleep(&interval, nullptr);
+    }
+}
+
+
+/*
+void *timer_handler(void *arg) {
+    // check through
+    struct timespec interval{};
+    interval.tv_sec = 0;
+    interval.tv_nsec = 1000;
 
     while(true) {
         pthread_mutex_lock(&dacStreamLock);
         for (auto & dacStream : dacStreams) {
             dacStream_t *dtr = &dacStream;
+            uint16_t sId = dtr->streamId;
             if (!dtr->_running || dtr->restart) {
                 //LOG_I("Thread: Got streamId %02X running!",i);
                 // if it's JUST triggered
 
                 dtr->_running = true;
                 dtr->_currentTime = dtr->frequencyInus;
-                dtr->_currentPosition = blockPtrs[dtr->streamId].location;
+                dtr->_currentPosition = blockPtrs[sId].location;
             }
             if (dtr->_running) {
                 // handling current sample
-                if((dtr->_currentTime -= 0.5) < 0) {
+                if((dtr->_currentTime -= 1.0) < 0) {
+
                     if(dtr->_currentPosition >= blockPtrs[dtr->streamId].location + blockPtrs[dtr->streamId].size) {
                         dtr->_running = false;
                         dtr->isRunning = false;
@@ -1345,8 +1430,9 @@ void *timer_handler(void *arg) {
 
                     // put sample
                     vgm_chip_base* base = find_chip(CHIP_YM2612,0);
-                    base->seek_pcm(dtr->_currentPosition++);
-                    base->write(0x2a,base->read_pcm() & 0x7F);
+                    //base->seek_pcm(dtr->_currentPosition++);
+                    base->write(0x2a,blockPtrs[sId].fifo.front());
+                    blockPtrs[sId].fifo.pop_front();
                     if(dtr->_currentTime <= 0.0) dtr->_currentTime = dtr->frequencyInus;
                     // TODO:: PROPERLY IMPLEMENT
                 }
@@ -1358,8 +1444,7 @@ void *timer_handler(void *arg) {
     }
     return nullptr;
 }
-
-
+*/
 
 class MyCallback : public oboe::AudioStreamDataCallback {
 public:
@@ -1391,6 +1476,8 @@ std::shared_ptr<ErrorCallback> mErrorCallback;
 extern "C"
 JNIEXPORT void JNICALL
 Java_team_digitalfairy_ymfm_1thing_YmfmInterface_startOboe(JNIEnv *env, jclass clazz) {
+    LOG_I("In Start!");
+
     mMyCallback = std::make_shared<MyCallback>();
     mErrorCallback = std::make_shared<ErrorCallback>();
 
@@ -1442,8 +1529,13 @@ Java_team_digitalfairy_ymfm_1thing_YmfmInterface_startOboe(JNIEnv *env, jclass c
 
     // Make timer to scan through DACStream
 
-
+    pthread_t pthr;
     int result = pthread_create(&pthr, nullptr, timer_handler, nullptr);
+    /*
+    struct sched_param param{};
+    param.sched_priority = sched_get_priority_max(SCHED_FIFO);
+    pthread_setschedparam(pthr,SCHED_OTHER,&param);
+    */
     /*
     timer_t timer;
     struct sigaction sa{};
