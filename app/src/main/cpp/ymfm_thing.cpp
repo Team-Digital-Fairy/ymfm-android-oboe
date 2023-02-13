@@ -1353,6 +1353,7 @@ typedef struct {
 
 } inStream_t;
 
+/*
 void *timer_handler(void *arg) {
     // check through
     inStream_t threadStream[4];
@@ -1394,7 +1395,7 @@ void *timer_handler(void *arg) {
         nanosleep(&interval, nullptr);
     }
 }
-
+*/
 
 /*
 void *timer_handler(void *arg) {
@@ -1529,8 +1530,8 @@ Java_team_digitalfairy_ymfm_1thing_YmfmInterface_startOboe(JNIEnv *env, jclass c
 
     // Make timer to scan through DACStream
 
-    pthread_t pthr;
-    int result = pthread_create(&pthr, nullptr, timer_handler, nullptr);
+    //pthread_t pthr;
+    //int result = pthread_create(&pthr, nullptr, timer_handler, nullptr);
     /*
     struct sched_param param{};
     param.sched_priority = sched_get_priority_max(SCHED_FIFO);
